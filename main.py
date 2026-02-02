@@ -12,10 +12,16 @@ mcp = FastMCP("memory-decay")
 # --- CONFIG ---
 BASE_DATA_DIR = os.getenv("MEMORY_STORAGE_PATH", "./data")
 DB_URI = os.path.join(BASE_DATA_DIR, "memory-lancedb")
-JOURNAL_FILE = os.path.join(BASE_DATA_DIR, "permanent_journal.jsonl")  # The "Truth" file
+JOURNAL_FILE = os.path.join(BASE_DATA_DIR, "permanent_journal.jsonl")
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-DECAY_HALF_LIFE_HOURS = 24 * 7
-MIN_STRENGTH_THRESHOLD = 0.2
+MIN_STRENGTH_THRESHOLD = 0.15
+
+# Domain-Specific Half-Lives (in hours)
+DECAY_CONFIG = {
+    "episodic": 24 * 7,      # 1 week: Events, logs, temporary context
+    "semantic": 24 * 30,     # 1 month: General facts, user preferences
+    "procedural": 24 * 365,  # 1 year: Skills, workflows, code patterns
+}
 
 # --- SETUP ---
 if not os.path.exists(BASE_DATA_DIR):
@@ -24,15 +30,21 @@ if not os.path.exists(BASE_DATA_DIR):
 db = lancedb.connect(DB_URI)
 model = SentenceTransformer(EMBEDDING_MODEL)
 
-# Initialize LanceDB (The "Brain")
+# Initialize LanceDB
 try:
     tbl = db.open_table("memories")
+    # Ensure category field exists (migration for older versions)
+    if "category" not in tbl.schema.names:
+        df = tbl.to_pandas()
+        df["category"] = "semantic"
+        tbl = db.create_table("memories", data=df, mode="overwrite")
 except:
     dummy_vec = model.encode("init").tolist()
     data = [
         {
             "vector": dummy_vec,
             "text": "init",
+            "category": "semantic",
             "created_at": time.time(),
             "last_accessed": time.time(),
             "access_count": 1,
@@ -42,17 +54,21 @@ except:
     tbl = db.create_table("memories", data=data, mode="overwrite")
 
 
-# --- HELPER: The Decay Math ---
-def calculate_strength(last_accessed, base_strength, access_count):
+# --- HELPER: The Decay & Reinforcement Math ---
+def calculate_strength(last_accessed, base_strength, access_count, category):
+    half_life = DECAY_CONFIG.get(category, DECAY_CONFIG["episodic"])
     elapsed_hours = (time.time() - last_accessed) / 3600
-    decay = 2 ** (-elapsed_hours / DECAY_HALF_LIFE_HOURS)
-    boost = np.log1p(access_count) * 0.1
+    
+    # Retrieval Strength (Decays)
+    decay = 2 ** (-elapsed_hours / half_life)
+    
+    # Hebbian Boost (Learning through retrieval)
+    boost = np.log1p(access_count) * 0.15
+    
     return min(base_strength * (decay + boost), 1.0)
 
 
-# --- HELPER: The "Journal" Writer ---
 def append_to_journal(content: str, metadata: dict):
-    """Writes to the immutable ledger. This never deletes."""
     entry = {
         "timestamp": datetime.now().isoformat(),
         "content": content,
@@ -64,20 +80,23 @@ def append_to_journal(content: str, metadata: dict):
 
 # --- TOOLS ---
 
-
 @mcp.tool()
-def store_memory(content: str) -> str:
+def store_memory(content: str, category: str = "episodic") -> str:
     """
-    Stores a memory in BOTH the active brain (for thinking)
-    and the permanent journal (for verification).
+    Stores a memory with a specific category (episodic, semantic, procedural).
+    - episodic: Short-term context (logs, current tasks).
+    - semantic: Facts, preferences, user identity.
+    - procedural: Code patterns, logic, workflows.
     """
-    # 1. Write to Vector DB (The Brain)
+    category = category.lower() if category.lower() in DECAY_CONFIG else "episodic"
     embedding = model.encode(content).tolist()
+    
     tbl.add(
         [
             {
                 "vector": embedding,
                 "text": content,
+                "category": category,
                 "created_at": time.time(),
                 "last_accessed": time.time(),
                 "access_count": 1,
@@ -86,63 +105,63 @@ def store_memory(content: str) -> str:
         ]
     )
 
-    # 2. Write to Flat File (The Journal)
-    append_to_journal(content, {"type": "user_observation"})
-
-    return "Memory stored in active recall and permanent ledger."
+    append_to_journal(content, {"type": "user_observation", "category": category})
+    return f"Stored as {category} memory."
 
 
 @mcp.tool()
 def recall_memory(query: str) -> str:
     """
-    Standard retrieval. Uses decay.
-    WARNING: May yield incomplete info if memory is old.
-    Use this for thinking/context.
+    Retrieves memories based on semantic relevance and decay.
+    Successfully recalled memories receive a 'Hebbian boost', refreshing their strength.
     """
     embedding = model.encode(query).tolist()
-    results = tbl.search(embedding).limit(10).to_pandas()
+    results = tbl.search(embedding).limit(5).to_pandas()
 
     if results.empty:
         return "No active memories found."
 
-    valid = []
+    valid_responses = []
+    to_boost = [] # List of (text, current_access_count)
+
     for _, row in results.iterrows():
         strength = calculate_strength(
-            row["last_accessed"], row["base_strength"], row["access_count"]
+            row["last_accessed"], row["base_strength"], row["access_count"], row["category"]
         )
+        
         if strength >= MIN_STRENGTH_THRESHOLD:
-            valid.append(f"[{strength:.2f}] {row['text']}")
+            valid_responses.append(f"[{row['category'].upper()} | Strength: {strength:.2f}] {row['text']}")
+            to_boost.append((row["text"], row["access_count"])) 
 
-    if not valid:
-        return "Memories exist but have faded below threshold. Use verify_history for deep search."
+    # Reinforcement Learning: Update accessed memories
+    if to_boost:
+        now = time.time()
+        for text, current_count in to_boost:
+            # In a real app, we'd use a unique ID. Here we filter by text for simplicity.
+            tbl.update(where=f'text = "{text}"', values={"last_accessed": now, "access_count": current_count + 1})
 
-    return "\n".join(valid)
+    if not valid_responses:
+        return "Relevant memories have faded. Try 'verify_history' for archival search."
+
+    return "\n".join(valid_responses)
 
 
 @mcp.tool()
-def verify_history(keyword: str, date_filter: str = None) -> str:
+def verify_history(keyword: str) -> str:
     """
-    AUDIT TOOL. Bypasses all decay logic.
-    Reads the raw permanent_journal.jsonl file.
-    Use this when the user challenges your memory or asks 'Did I say that?'.
-    SLOW operation.
+    Bypasses decay to search the immutable Archive. Use for audit or when recall fails.
     """
     matches = []
     try:
         with open(JOURNAL_FILE, "r", encoding="utf-8") as f:
             for line in f:
                 entry = json.loads(line)
-                # Simple string matching (or add regex logic here)
                 if keyword.lower() in entry["content"].lower():
                     matches.append(f"[{entry['timestamp']}] {entry['content']}")
     except FileNotFoundError:
-        return "No journal found."
+        return "Archive is empty."
 
-    if not matches:
-        return "No record found in permanent journal."
-
-    return "VERIFICATION RECORD:\n" + "\n".join(matches[-10:])  # Return last 10 matches
-
+    return "ARCHIVE RECORD:\n" + "\n".join(matches[-10:]) if matches else "No matching record."
 
 if __name__ == "__main__":
     mcp.run()
