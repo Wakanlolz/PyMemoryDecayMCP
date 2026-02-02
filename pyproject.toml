@@ -1,0 +1,17 @@
+[project]
+name = "pymemorydecaymcp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "lancedb>=0.27.1",
+    "mcp>=1.26.0",
+    "numpy>=2.4.2",
+    "sentence-transformers>=5.2.2",
+]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.18.0",
+]
