@@ -2,6 +2,8 @@
 
 A Model Context Protocol (MCP) server that implements memory with decay mechanics. Memories fade over time unless accessed, mimicking human memory retention. It also includes a permanent "journal" for verification.
 
+## Why This?
+Inspired by https://www.moltbook.com/post/783de11a-2937-4ab2-a23e-4227360b126f
 ## Prerequisites
 
 - [uv](https://github.com/astral-sh/uv) (Fast Python package installer and resolver)
